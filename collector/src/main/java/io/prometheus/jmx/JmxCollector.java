@@ -26,6 +26,7 @@ import io.prometheus.metrics.core.metrics.Counter;
 import io.prometheus.metrics.core.metrics.Gauge;
 import io.prometheus.metrics.model.registry.MultiCollector;
 import io.prometheus.metrics.model.registry.PrometheusRegistry;
+import io.prometheus.metrics.model.registry.PrometheusScrapeRequest;
 import io.prometheus.metrics.model.snapshots.MetricSnapshots;
 import io.prometheus.metrics.model.snapshots.Unit;
 import java.io.File;
@@ -34,14 +35,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.TreeMap;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.management.MalformedObjectNameException;
@@ -86,8 +81,6 @@ public class JmxCollector implements MultiCollector {
         ObjectNameAttributeFilter objectNameAttributeFilter;
         List<Rule> rules = new ArrayList<>();
         long lastUpdate = 0L;
-
-        MatchedRulesCache rulesCache;
     }
 
     private PrometheusRegistry prometheusRegistry;
@@ -101,7 +94,9 @@ public class JmxCollector implements MultiCollector {
     private Gauge jmxScrapeError;
     private Gauge jmxScrapeCachedBeans;
 
-    private final JmxMBeanPropertyCache jmxMBeanPropertyCache = new JmxMBeanPropertyCache();
+    private final Map<String, MatchedRulesCache> rulesCacheMap = new ConcurrentHashMap<>();
+    private final Map<String, JmxMBeanPropertyCache> jmxMBeanPropertyCacheMap =
+            new ConcurrentHashMap<>();
 
     public JmxCollector(File in) throws IOException, MalformedObjectNameException {
         this(in, null);
@@ -363,7 +358,9 @@ public class JmxCollector implements MultiCollector {
             cfg.rules.add(new Rule());
         }
 
-        cfg.rulesCache = new MatchedRulesCache(cfg.rules);
+        for (String target : rulesCacheMap.keySet()) {
+            rulesCacheMap.computeIfPresent(target, (t, v) -> new MatchedRulesCache(cfg.rules));
+        }
         cfg.objectNameAttributeFilter = ObjectNameAttributeFilter.create(yamlConfig);
 
         return cfg;
@@ -437,12 +434,17 @@ public class JmxCollector implements MultiCollector {
 
         Config config;
         MatchedRulesCache.StalenessTracker stalenessTracker;
+        MatchedRulesCache rulesCache;
 
         private static final char SEP = '_';
 
-        Receiver(Config config, MatchedRulesCache.StalenessTracker stalenessTracker) {
+        Receiver(
+                Config config,
+                MatchedRulesCache.StalenessTracker stalenessTracker,
+                MatchedRulesCache rulesCache) {
             this.config = config;
             this.stalenessTracker = stalenessTracker;
+            this.rulesCache = rulesCache;
         }
 
         // [] and () are special in regexes, so swtich to <>.
@@ -455,7 +457,7 @@ public class JmxCollector implements MultiCollector {
         private void addToCache(
                 final Rule rule, final String cacheKey, final MatchedRule matchedRule) {
             if (rule.cache) {
-                config.rulesCache.put(rule, cacheKey, matchedRule);
+                rulesCache.put(rule, cacheKey, matchedRule);
                 stalenessTracker.add(rule, cacheKey);
             }
         }
@@ -556,7 +558,7 @@ public class JmxCollector implements MultiCollector {
                 String matchName = beanName + attributeName + ": " + matchBeanValue;
 
                 if (rule.cache) {
-                    MatchedRule cachedRule = config.rulesCache.get(rule, matchName);
+                    MatchedRule cachedRule = rulesCache.get(rule, matchName);
                     if (cachedRule != null) {
                         stalenessTracker.add(rule, matchName);
                         if (cachedRule.isMatched()) {
@@ -707,18 +709,36 @@ public class JmxCollector implements MultiCollector {
 
     @Override
     public MetricSnapshots collect() {
+        return collect((PrometheusScrapeRequest) null);
+    }
+
+    public MetricSnapshots collect(PrometheusScrapeRequest scrapeRequest) {
         // Take a reference to the current config and collect with this one
         // (to avoid race conditions in case another thread reloads the config in the meantime)
         Config config = getLatestConfig();
 
+        String[] targets =
+                scrapeRequest != null ? scrapeRequest.getParameterValues("target") : null;
+        String target;
+        if (targets == null || targets.length == 0) {
+            target = config.jmxUrl;
+        } else {
+            target = "service:jmx:rmi:///jndi/rmi://" + targets[0] + "/jmxrmi";
+        }
+
+        rulesCacheMap.computeIfAbsent(target, t -> new MatchedRulesCache(config.rules));
+        MatchedRulesCache matchedRulesCache = rulesCacheMap.get(target);
+        jmxMBeanPropertyCacheMap.computeIfAbsent(target, t -> new JmxMBeanPropertyCache());
+        JmxMBeanPropertyCache propertyCache = jmxMBeanPropertyCacheMap.get(target);
+
         MatchedRulesCache.StalenessTracker stalenessTracker =
                 new MatchedRulesCache.StalenessTracker();
 
-        Receiver receiver = new Receiver(config, stalenessTracker);
+        Receiver receiver = new Receiver(config, stalenessTracker, matchedRulesCache);
 
         JmxScraper scraper =
                 new JmxScraper(
-                        config.jmxUrl,
+                        target,
                         config.username,
                         config.password,
                         config.ssl,
@@ -726,7 +746,7 @@ public class JmxCollector implements MultiCollector {
                         config.excludeObjectNames,
                         config.objectNameAttributeFilter,
                         receiver,
-                        jmxMBeanPropertyCache);
+                        propertyCache);
 
         long start = System.nanoTime();
         double error = 0;
@@ -744,7 +764,7 @@ public class JmxCollector implements MultiCollector {
             LOGGER.log(SEVERE, "JMX scrape failed: %s", sw);
         }
 
-        config.rulesCache.evictStaleEntries(stalenessTracker);
+        matchedRulesCache.evictStaleEntries(stalenessTracker);
 
         jmxScrapeDurationSeconds.set((System.nanoTime() - start) / 1.0E9);
         jmxScrapeError.set(error);
